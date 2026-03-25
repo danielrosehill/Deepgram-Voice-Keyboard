@@ -5,8 +5,9 @@ use global_hotkey::{
     GlobalHotKeyEvent, GlobalHotKeyManager,
 };
 use iced::{
+    time,
     widget::{button, column, container, horizontal_rule, row, scrollable, text, text_input, Space},
-    Color, Element, Font, Length, Task, Theme,
+    Color, Element, Font, Length, Subscription, Task, Theme,
 };
 use rodio::{source::SineWave, OutputStream, Sink, Source};
 use serde::{Deserialize, Serialize};
@@ -174,49 +175,63 @@ impl Drop for VoiceKeyboardGui {
     }
 }
 
-// ── Styling helpers ─────────────────────────────────────────────────────
+// ── Styling helpers (light theme) ────────────────────────────────────────
 
 const ACCENT: Color = Color {
-    r: 0.243,
-    g: 0.573,
-    b: 0.988,
+    r: 0.176,
+    g: 0.447,
+    b: 0.882,
     a: 1.0,
 };
 
 const RECORDING_RED: Color = Color {
-    r: 0.918,
-    g: 0.282,
-    b: 0.282,
+    r: 0.847,
+    g: 0.212,
+    b: 0.212,
     a: 1.0,
 };
 
 const SUCCESS_GREEN: Color = Color {
-    r: 0.298,
-    g: 0.686,
-    b: 0.314,
+    r: 0.180,
+    g: 0.600,
+    b: 0.302,
     a: 1.0,
 };
 
+// Card / header background — light gray
 const SURFACE: Color = Color {
-    r: 0.145,
-    g: 0.153,
-    b: 0.176,
+    r: 0.945,
+    g: 0.949,
+    b: 0.957,
     a: 1.0,
 };
 
+// Secondary surfaces / borders
 const SURFACE_LIGHT: Color = Color {
-    r: 0.192,
-    g: 0.200,
-    b: 0.227,
+    r: 0.898,
+    g: 0.906,
+    b: 0.918,
     a: 1.0,
 };
 
+// Muted text
 const TEXT_DIM: Color = Color {
-    r: 0.596,
-    g: 0.616,
-    b: 0.667,
+    r: 0.420,
+    g: 0.447,
+    b: 0.494,
     a: 1.0,
 };
+
+// Primary text
+const TEXT_PRIMARY: Color = Color {
+    r: 0.118,
+    g: 0.133,
+    b: 0.165,
+    a: 1.0,
+};
+
+// App background — white
+const BG: Color = Color::WHITE;
 
 fn record_button_style(
     recording: bool,
@@ -238,10 +253,10 @@ fn record_button_style(
 fn nav_button_style(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_theme: &Theme, _status: button::Status| {
         let bg = if active { ACCENT } else { SURFACE_LIGHT };
-        let text = if active { Color::WHITE } else { TEXT_DIM };
+        let text_color = if active { Color::WHITE } else { TEXT_DIM };
         button::Style {
             background: Some(iced::Background::Color(bg)),
-            text_color: text,
+            text_color,
             border: iced::Border {
                 radius: 6.0.into(),
                 ..Default::default()
@@ -253,7 +268,7 @@ fn nav_button_style(active: bool) -> impl Fn(&Theme, button::Status) -> button::
 
 fn secondary_button_style(_theme: &Theme, _status: button::Status) -> button::Style {
     button::Style {
-        background: Some(iced::Background::Color(SURFACE_LIGHT)),
+        background: Some(iced::Background::Color(ACCENT)),
         text_color: Color::WHITE,
         border: iced::Border {
             radius: 6.0.into(),
@@ -276,12 +291,7 @@ fn card_style(_theme: &Theme) -> container::Style {
 
 fn transcript_area_style(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(iced::Background::Color(Color {
-            r: 0.098,
-            g: 0.106,
-            b: 0.125,
-            a: 1.0,
-        })),
+        background: Some(iced::Background::Color(SURFACE)),
         border: iced::Border {
             radius: 8.0.into(),
             color: SURFACE_LIGHT,
@@ -551,11 +561,6 @@ impl VoiceKeyboardGui {
                 if self.is_recording {
                     self.read_child_output();
                 }
-                // Schedule next tick
-                return Task::future(async {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    Message::Tick
-                });
             }
             Message::ApiKeyChanged(value) => {
                 self.api_key_input = value;
@@ -646,6 +651,10 @@ impl VoiceKeyboardGui {
         Task::none()
     }
 
+    fn subscription(&self) -> Subscription<Message> {
+        time::every(Duration::from_millis(50)).map(|_| Message::Tick)
+    }
+
     // ── Views ───────────────────────────────────────────────────────────
 
     fn view(&self) -> Element<Message> {
@@ -663,12 +672,7 @@ impl VoiceKeyboardGui {
             .width(Length::Fill)
             .height(Length::Fill)
             .style(|_theme: &Theme| container::Style {
-                background: Some(iced::Background::Color(Color {
-                    r: 0.098,
-                    g: 0.106,
-                    b: 0.125,
-                    a: 1.0,
-                })),
+                background: Some(iced::Background::Color(BG)),
                 ..container::Style::default()
             })
             .into()
@@ -688,7 +692,7 @@ impl VoiceKeyboardGui {
         let title = text("Voice Keyboard")
             .size(22)
             .font(Font::DEFAULT)
-            .color(Color::WHITE);
+            .color(TEXT_PRIMARY);
 
         let status = text(&self.status_message)
             .size(13)
@@ -766,7 +770,7 @@ impl VoiceKeyboardGui {
             transcript_content.push(
                 text(&self.current_transcript)
                     .size(14)
-                    .color(Color::WHITE)
+                    .color(TEXT_PRIMARY)
                     .into(),
             );
         }
@@ -779,12 +783,7 @@ impl VoiceKeyboardGui {
                     "Transcripts will appear here"
                 })
                 .size(13)
-                .color(Color {
-                    r: 0.4,
-                    g: 0.42,
-                    b: 0.46,
-                    a: 1.0,
-                })
+                .color(TEXT_DIM)
                 .into(),
             );
         }
@@ -930,16 +929,9 @@ impl VoiceKeyboardGui {
 
 fn main() -> iced::Result {
     iced::application("Voice Keyboard", VoiceKeyboardGui::update, VoiceKeyboardGui::view)
-        .theme(|_| Theme::Dark)
+        .subscription(VoiceKeyboardGui::subscription)
+        .theme(|_| Theme::Light)
         .window_size((480.0, 560.0))
         .centered()
-        .run_with(|| {
-            let (gui, task) = VoiceKeyboardGui::new();
-            // Kick off the tick loop
-            let tick_task = Task::future(async {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                Message::Tick
-            });
-            (gui, Task::batch([task, tick_task]))
-        })
+        .run_with(VoiceKeyboardGui::new)
 }
