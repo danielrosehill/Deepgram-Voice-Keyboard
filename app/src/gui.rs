@@ -5,40 +5,26 @@ use global_hotkey::{
     GlobalHotKeyEvent, GlobalHotKeyManager,
 };
 use iced::{
-    widget::{button, column, container, text, text_input},
-    window, Element, Length, Task, Theme,
+    widget::{button, column, container, horizontal_rule, row, scrollable, text, text_input, Space},
+    Color, Element, Font, Length, Task, Theme,
 };
 use rodio::{source::SineWave, OutputStream, Sink, Source};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-// Tray icon disabled - requires GTK which is incompatible with KDE/Wayland
-// use tray_icon::{
-//     menu::{Menu, MenuItem},
-//     TrayIcon, TrayIconBuilder,
-// };
 use reqwest::Client;
+
+// ── Config ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
     api_key: String,
     hotkey_code: String,
     project_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BillingBalance {
-    balance_id: String,
-    amount: f64,
-    units: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BillingResponse {
-    balances: Vec<BillingBalance>,
 }
 
 impl Default for Config {
@@ -71,49 +57,109 @@ impl Config {
     }
 
     fn save(&self) -> Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
         let path = Self::config_path()?;
         let contents = serde_json::to_string_pretty(self)?;
-        fs::write(&path, contents)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        use std::io::Write;
+        file.write_all(contents.as_bytes())?;
         Ok(())
     }
 }
 
+// ── Billing ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BillingBalance {
+    #[allow(dead_code)]
+    balance_id: String,
+    amount: f64,
+    units: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BillingResponse {
+    balances: Vec<BillingBalance>,
+}
+
+// ── Transcript event from JSON output ───────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TranscriptEvent {
+    event: String,
+    transcript: String,
+    #[serde(default)]
+    end_of_turn_confidence: f64,
+}
+
+// ── Application state ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AppView {
+    Main,
+    Settings,
+}
+
 #[derive(Debug, Clone)]
 enum Message {
+    // Navigation
+    SwitchView(AppView),
+    // Dictation
+    ToggleDictation,
+    #[allow(dead_code)]
+    TranscriptLine(String),
+    // Settings
     ApiKeyChanged(String),
     HotkeyChanged(String),
     ProjectIdChanged(String),
     SaveConfig,
-    ToggleDictation,
+    // Billing
     CheckBalance,
     BalanceReceived(Result<BillingResponse, String>),
-    TrayEvent,
-    ShowWindow,
-    HideWindow,
+    // Hotkey triggered from background thread
+    #[allow(dead_code)]
+    HotkeyTriggered,
+    // Periodic tick to read child stdout
+    Tick,
 }
 
 struct VoiceKeyboardGui {
     config: Config,
+    view: AppView,
+    // Settings inputs
     api_key_input: String,
     hotkey_input: String,
     project_id_input: String,
+    // Dictation state
     is_recording: bool,
     status_message: String,
+    transcript_lines: Vec<String>,
+    current_transcript: String,
+    // Billing
     balance_info: String,
+    // Process management
     voice_keyboard_process: Arc<Mutex<Option<Child>>>,
-    _hotkey_manager: GlobalHotKeyManager,
+    child_stdout: Arc<Mutex<Option<BufReader<std::process::ChildStdout>>>>,
+    // Audio
     _audio_output_stream: OutputStream,
     audio_sink: Arc<Mutex<Sink>>,
-    // _tray_icon: Option<TrayIcon>,  // Disabled for KDE compatibility
+    // Hotkey
+    _hotkey_manager: GlobalHotKeyManager,
+    // HTTP
     http_client: Client,
+    // Hotkey receiver
+    hotkey_rx: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
 }
 
 impl Drop for VoiceKeyboardGui {
     fn drop(&mut self) {
-        // Ensure child process is terminated when GUI is closed
         if let Some(mut child) = self.voice_keyboard_process.lock().unwrap().take() {
             let _ = child.kill();
-            // Wait up to 1 second for clean shutdown
             let start = std::time::Instant::now();
             while start.elapsed() < Duration::from_secs(1) {
                 match child.try_wait() {
@@ -122,12 +168,130 @@ impl Drop for VoiceKeyboardGui {
                     Err(_) => break,
                 }
             }
-            // Force kill if still running
             let _ = child.kill();
             let _ = child.wait();
         }
     }
 }
+
+// ── Styling helpers ─────────────────────────────────────────────────────
+
+const ACCENT: Color = Color {
+    r: 0.243,
+    g: 0.573,
+    b: 0.988,
+    a: 1.0,
+};
+
+const RECORDING_RED: Color = Color {
+    r: 0.918,
+    g: 0.282,
+    b: 0.282,
+    a: 1.0,
+};
+
+const SUCCESS_GREEN: Color = Color {
+    r: 0.298,
+    g: 0.686,
+    b: 0.314,
+    a: 1.0,
+};
+
+const SURFACE: Color = Color {
+    r: 0.145,
+    g: 0.153,
+    b: 0.176,
+    a: 1.0,
+};
+
+const SURFACE_LIGHT: Color = Color {
+    r: 0.192,
+    g: 0.200,
+    b: 0.227,
+    a: 1.0,
+};
+
+const TEXT_DIM: Color = Color {
+    r: 0.596,
+    g: 0.616,
+    b: 0.667,
+    a: 1.0,
+};
+
+fn record_button_style(
+    recording: bool,
+) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme: &Theme, _status: button::Status| {
+        let bg_color = if recording { RECORDING_RED } else { SUCCESS_GREEN };
+        button::Style {
+            background: Some(iced::Background::Color(bg_color)),
+            text_color: Color::WHITE,
+            border: iced::Border {
+                radius: 8.0.into(),
+                ..Default::default()
+            },
+            ..button::Style::default()
+        }
+    }
+}
+
+fn nav_button_style(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme: &Theme, _status: button::Status| {
+        let bg = if active { ACCENT } else { SURFACE_LIGHT };
+        let text = if active { Color::WHITE } else { TEXT_DIM };
+        button::Style {
+            background: Some(iced::Background::Color(bg)),
+            text_color: text,
+            border: iced::Border {
+                radius: 6.0.into(),
+                ..Default::default()
+            },
+            ..button::Style::default()
+        }
+    }
+}
+
+fn secondary_button_style(_theme: &Theme, _status: button::Status) -> button::Style {
+    button::Style {
+        background: Some(iced::Background::Color(SURFACE_LIGHT)),
+        text_color: Color::WHITE,
+        border: iced::Border {
+            radius: 6.0.into(),
+            ..Default::default()
+        },
+        ..button::Style::default()
+    }
+}
+
+fn card_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Background::Color(SURFACE)),
+        border: iced::Border {
+            radius: 10.0.into(),
+            ..Default::default()
+        },
+        ..container::Style::default()
+    }
+}
+
+fn transcript_area_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Background::Color(Color {
+            r: 0.098,
+            g: 0.106,
+            b: 0.125,
+            a: 1.0,
+        })),
+        border: iced::Border {
+            radius: 8.0.into(),
+            color: SURFACE_LIGHT,
+            width: 1.0,
+        },
+        ..container::Style::default()
+    }
+}
+
+// ── Application logic ───────────────────────────────────────────────────
 
 impl VoiceKeyboardGui {
     fn new() -> (Self, Task<Message>) {
@@ -136,161 +300,63 @@ impl VoiceKeyboardGui {
         let hotkey_input = config.hotkey_code.clone();
         let project_id_input = config.project_id.clone();
 
-        // Initialize audio system
+        // Set API key from saved config
+        if !config.api_key.is_empty() {
+            unsafe { std::env::set_var("DEEPGRAM_API_KEY", &config.api_key) };
+        }
+
+        // Audio
         let (stream, stream_handle) = OutputStream::try_default().unwrap();
         let sink = Sink::try_new(&stream_handle).unwrap();
 
-        // Initialize hotkey manager
+        // Hotkey
         let hotkey_manager = GlobalHotKeyManager::new().unwrap();
-
-        // Register F13 hotkey
         let hotkey = HotKey::new(None, Code::F13);
         hotkey_manager.register(hotkey).ok();
 
-        // System tray disabled for KDE/Wayland compatibility
-        // The tray-icon crate requires GTK initialization which conflicts with KDE
-
-        let gui = Self {
-            config,
-            api_key_input,
-            hotkey_input,
-            project_id_input,
-            is_recording: false,
-            status_message: "Ready".to_string(),
-            balance_info: "Click 'Check Balance' to view billing info".to_string(),
-            voice_keyboard_process: Arc::new(Mutex::new(None)),
-            _hotkey_manager: hotkey_manager,
-            _audio_output_stream: stream,
-            audio_sink: Arc::new(Mutex::new(sink)),
-            // _tray_icon: tray_icon,  // Disabled for KDE compatibility
-            http_client: Client::new(),
-        };
-
-        // Start hotkey listener
-        let process_clone = gui.voice_keyboard_process.clone();
-        let audio_sink_clone = gui.audio_sink.clone();
+        // Channel for hotkey events
+        let (hotkey_tx, hotkey_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let receiver = GlobalHotKeyEvent::receiver();
             loop {
-                if let Ok(_event) = receiver.recv() {
-                    // Toggle dictation
-                    let mut process_lock = process_clone.lock().unwrap();
-                    let is_running = process_lock.is_some();
-
-                    if is_running {
-                        // Stop recording - play lower beep
-                        if let Ok(sink) = audio_sink_clone.lock() {
-                            let source = SineWave::new(400.0)
-                                .take_duration(Duration::from_millis(100))
-                                .amplify(0.3);
-                            sink.append(source);
-                        }
-
-                        if let Some(mut child) = process_lock.take() {
-                            // Send SIGTERM first for graceful shutdown
-                            let _ = child.kill();
-                            // Wait up to 2 seconds for process to terminate
-                            let start = std::time::Instant::now();
-                            while start.elapsed() < Duration::from_secs(2) {
-                                match child.try_wait() {
-                                    Ok(Some(_)) => break, // Process exited
-                                    Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-                                    Err(_) => break,
-                                }
-                            }
-                            // Force kill if still running
-                            let _ = child.kill();
-                            let _ = child.wait();
-                        }
-                    } else {
-                        // Start recording - play distinctive double beep
-                        if let Ok(sink) = audio_sink_clone.lock() {
-                            // First beep - high pitch
-                            let beep1 = SineWave::new(1000.0)
-                                .take_duration(Duration::from_millis(80))
-                                .amplify(0.35);
-                            sink.append(beep1);
-
-                            // Short pause
-                            std::thread::sleep(Duration::from_millis(50));
-
-                            // Second beep - even higher pitch for brightness
-                            let beep2 = SineWave::new(1200.0)
-                                .take_duration(Duration::from_millis(80))
-                                .amplify(0.35);
-                            sink.append(beep2);
-                        }
-
-                        // Start the voice keyboard process
-                        if let Ok(api_key) = std::env::var("DEEPGRAM_API_KEY") {
-                            if !api_key.is_empty() {
-                                let exe_path = std::env::current_exe()
-                                    .unwrap()
-                                    .parent()
-                                    .unwrap()
-                                    .join("voice-keyboard");
-
-                                let mut cmd = Command::new("pkexec");
-                                cmd.arg("env")
-                                    .arg(format!("DEEPGRAM_API_KEY={}", api_key));
-
-                                // Preserve audio session environment variables
-                                if let Ok(val) = std::env::var("PULSE_RUNTIME_PATH") {
-                                    cmd.arg(format!("PULSE_RUNTIME_PATH={}", val));
-                                }
-                                if let Ok(val) = std::env::var("XDG_RUNTIME_DIR") {
-                                    cmd.arg(format!("XDG_RUNTIME_DIR={}", val));
-                                }
-                                if let Ok(val) = std::env::var("DISPLAY") {
-                                    cmd.arg(format!("DISPLAY={}", val));
-                                }
-                                if let Ok(val) = std::env::var("WAYLAND_DISPLAY") {
-                                    cmd.arg(format!("WAYLAND_DISPLAY={}", val));
-                                }
-                                if let Ok(val) = std::env::var("HOME") {
-                                    cmd.arg(format!("HOME={}", val));
-                                }
-                                if let Ok(val) = std::env::var("USER") {
-                                    cmd.arg(format!("USER={}", val));
-                                }
-
-                                cmd.arg(&exe_path).arg("--test-stt");
-
-                                if let Ok(child) = cmd.spawn() {
-                                    *process_lock = Some(child);
-                                }
-                            }
-                        }
-                    }
+                if receiver.recv().is_ok() {
+                    let _ = hotkey_tx.send(());
                 }
             }
         });
 
-        (gui, Task::none())
-    }
+        let gui = Self {
+            config,
+            view: AppView::Main,
+            api_key_input,
+            hotkey_input,
+            project_id_input,
+            is_recording: false,
+            status_message: "Ready — press F13 or click Start".to_string(),
+            transcript_lines: Vec::new(),
+            current_transcript: String::new(),
+            balance_info: String::new(),
+            voice_keyboard_process: Arc::new(Mutex::new(None)),
+            child_stdout: Arc::new(Mutex::new(None)),
+            _audio_output_stream: stream,
+            audio_sink: Arc::new(Mutex::new(sink)),
+            _hotkey_manager: hotkey_manager,
+            http_client: Client::new(),
+            hotkey_rx: Arc::new(Mutex::new(Some(hotkey_rx))),
+        };
 
-    fn play_beep(&self, frequency: f32) {
-        if let Ok(sink) = self.audio_sink.lock() {
-            let source = SineWave::new(frequency)
-                .take_duration(Duration::from_millis(100))
-                .amplify(0.3);
-            sink.append(source);
-        }
+        // Start a subscription-like tick to poll hotkey and child stdout
+        let task = Task::none();
+
+        (gui, task)
     }
 
     fn play_start_beep(&self) {
-        // Double beep for starting - bright and distinctive
         if let Ok(sink) = self.audio_sink.lock() {
-            // First beep - high pitch
             let beep1 = SineWave::new(1000.0)
                 .take_duration(Duration::from_millis(80))
                 .amplify(0.35);
             sink.append(beep1);
-
-            // Short pause
-            std::thread::sleep(Duration::from_millis(50));
-
-            // Second beep - even higher pitch for brightness
             let beep2 = SineWave::new(1200.0)
                 .take_duration(Duration::from_millis(80))
                 .amplify(0.35);
@@ -298,54 +364,64 @@ impl VoiceKeyboardGui {
         }
     }
 
+    fn play_stop_beep(&self) {
+        if let Ok(sink) = self.audio_sink.lock() {
+            let source = SineWave::new(400.0)
+                .take_duration(Duration::from_millis(100))
+                .amplify(0.3);
+            sink.append(source);
+        }
+    }
+
     fn start_dictation(&mut self) {
-        // Set the API key environment variable
-        std::env::set_var("DEEPGRAM_API_KEY", &self.config.api_key);
+        if self.config.api_key.is_empty() {
+            self.status_message = "No API key — go to Settings".to_string();
+            return;
+        }
 
-        // Play distinctive double beep for start
+        unsafe { std::env::set_var("DEEPGRAM_API_KEY", &self.config.api_key) };
+
         self.play_start_beep();
+        self.current_transcript.clear();
 
-        // Get the path to the voice-keyboard binary
         let exe_path = std::env::current_exe()
             .unwrap()
             .parent()
             .unwrap()
             .join("voice-keyboard");
 
-        // Start the voice-keyboard process with pkexec for sudo privileges
-        // Pass through necessary environment variables for audio access
         let mut cmd = Command::new("pkexec");
         cmd.arg("env")
             .arg(format!("DEEPGRAM_API_KEY={}", &self.config.api_key));
 
-        // Preserve audio session environment variables
-        if let Ok(val) = std::env::var("PULSE_RUNTIME_PATH") {
-            cmd.arg(format!("PULSE_RUNTIME_PATH={}", val));
-        }
-        if let Ok(val) = std::env::var("XDG_RUNTIME_DIR") {
-            cmd.arg(format!("XDG_RUNTIME_DIR={}", val));
-        }
-        if let Ok(val) = std::env::var("DISPLAY") {
-            cmd.arg(format!("DISPLAY={}", val));
-        }
-        if let Ok(val) = std::env::var("WAYLAND_DISPLAY") {
-            cmd.arg(format!("WAYLAND_DISPLAY={}", val));
-        }
-        if let Ok(val) = std::env::var("HOME") {
-            cmd.arg(format!("HOME={}", val));
-        }
-        if let Ok(val) = std::env::var("USER") {
-            cmd.arg(format!("USER={}", val));
+        // Preserve environment variables
+        for var in &[
+            "PULSE_RUNTIME_PATH",
+            "XDG_RUNTIME_DIR",
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "HOME",
+            "USER",
+        ] {
+            if let Ok(val) = std::env::var(var) {
+                cmd.arg(format!("{}={}", var, val));
+            }
         }
 
-        cmd.arg(&exe_path).arg("--test-stt");
+        cmd.arg(&exe_path)
+            .arg("--test-stt")
+            .arg("--json-output")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
 
-        match cmd.spawn()
-        {
-            Ok(child) => {
+        match cmd.spawn() {
+            Ok(mut child) => {
+                let stdout = child.stdout.take();
                 *self.voice_keyboard_process.lock().unwrap() = Some(child);
+                *self.child_stdout.lock().unwrap() =
+                    stdout.map(BufReader::new);
                 self.is_recording = true;
-                self.status_message = "Recording...".to_string();
+                self.status_message = "Listening...".to_string();
             }
             Err(e) => {
                 self.status_message = format!("Failed to start: {}", e);
@@ -354,31 +430,133 @@ impl VoiceKeyboardGui {
     }
 
     fn stop_dictation(&mut self) {
-        // Play stop beep (lower pitch)
-        self.play_beep(400.0);
+        self.play_stop_beep();
+
+        // Drain stdout reader
+        *self.child_stdout.lock().unwrap() = None;
 
         if let Some(mut child) = self.voice_keyboard_process.lock().unwrap().take() {
-            // Send SIGTERM first for graceful shutdown
             let _ = child.kill();
-            // Wait up to 2 seconds for process to terminate
             let start = std::time::Instant::now();
             while start.elapsed() < Duration::from_secs(2) {
                 match child.try_wait() {
-                    Ok(Some(_)) => break, // Process exited
-                    Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                    Ok(Some(_)) => break,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
                     Err(_) => break,
                 }
             }
-            // Force kill if still running
             let _ = child.kill();
             let _ = child.wait();
-            self.is_recording = false;
-            self.status_message = "Stopped".to_string();
+        }
+
+        // Finalize current transcript
+        if !self.current_transcript.is_empty() {
+            self.transcript_lines
+                .push(self.current_transcript.clone());
+            self.current_transcript.clear();
+        }
+
+        self.is_recording = false;
+        self.status_message = "Stopped".to_string();
+    }
+
+    fn read_child_output(&mut self) {
+        let mut stdout_lock = self.child_stdout.lock().unwrap();
+        if let Some(reader) = stdout_lock.as_mut() {
+            let mut line = String::new();
+            // Non-blocking: read available lines
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if let Ok(evt) = serde_json::from_str::<TranscriptEvent>(trimmed) {
+                            match evt.event.as_str() {
+                                "EndOfTurn" => {
+                                    if !self.current_transcript.is_empty() {
+                                        self.transcript_lines
+                                            .push(self.current_transcript.clone());
+                                    }
+                                    self.current_transcript.clear();
+                                    // Keep last 50 lines
+                                    if self.transcript_lines.len() > 50 {
+                                        self.transcript_lines.drain(0..self.transcript_lines.len() - 50);
+                                    }
+                                }
+                                "Update" | "StartOfTurn" | "EagerEndOfTurn" | "TurnResumed" => {
+                                    self.current_transcript = evt.transcript;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // Check if child process has exited
+        let mut proc_lock = self.voice_keyboard_process.lock().unwrap();
+        if let Some(child) = proc_lock.as_mut() {
+            match child.try_wait() {
+                Ok(Some(_status)) => {
+                    // Process exited
+                    drop(proc_lock);
+                    *self.child_stdout.lock().unwrap() = None;
+                    self.is_recording = false;
+                    self.status_message = "Ready — press F13 or click Start".to_string();
+                }
+                _ => {}
+            }
         }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::SwitchView(view) => {
+                self.view = view;
+            }
+            Message::ToggleDictation | Message::HotkeyTriggered => {
+                if self.is_recording {
+                    self.stop_dictation();
+                } else {
+                    self.start_dictation();
+                }
+            }
+            Message::TranscriptLine(line) => {
+                self.transcript_lines.push(line);
+            }
+            Message::Tick => {
+                // Check hotkey — collect events first, then act
+                let mut hotkey_triggered = false;
+                if let Ok(rx_lock) = self.hotkey_rx.lock() {
+                    if let Some(rx) = rx_lock.as_ref() {
+                        while rx.try_recv().is_ok() {
+                            hotkey_triggered = true;
+                        }
+                    }
+                }
+                if hotkey_triggered {
+                    if self.is_recording {
+                        self.stop_dictation();
+                    } else {
+                        self.start_dictation();
+                    }
+                }
+                // Read child output
+                if self.is_recording {
+                    self.read_child_output();
+                }
+                // Schedule next tick
+                return Task::future(async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Message::Tick
+                });
+            }
             Message::ApiKeyChanged(value) => {
                 self.api_key_input = value;
             }
@@ -394,18 +572,14 @@ impl VoiceKeyboardGui {
                 self.config.project_id = self.project_id_input.clone();
                 match self.config.save() {
                     Ok(_) => {
-                        self.status_message = "Configuration saved!".to_string();
+                        unsafe {
+                            std::env::set_var("DEEPGRAM_API_KEY", &self.config.api_key);
+                        }
+                        self.status_message = "Settings saved".to_string();
                     }
                     Err(e) => {
-                        self.status_message = format!("Failed to save config: {}", e);
+                        self.status_message = format!("Save failed: {}", e);
                     }
-                }
-            }
-            Message::ToggleDictation => {
-                if self.is_recording {
-                    self.stop_dictation();
-                } else {
-                    self.start_dictation();
                 }
             }
             Message::CheckBalance => {
@@ -413,8 +587,18 @@ impl VoiceKeyboardGui {
                 let project_id = self.config.project_id.clone();
                 let client = self.http_client.clone();
 
+                if project_id.is_empty() || api_key.is_empty() {
+                    self.balance_info = "Set API key and Project ID first".to_string();
+                    return Task::none();
+                }
+
+                self.balance_info = "Checking...".to_string();
+
                 return Task::future(async move {
-                    let url = format!("https://api.deepgram.com/v1/projects/{}/balances", project_id);
+                    let url = format!(
+                        "https://api.deepgram.com/v1/projects/{}/balances",
+                        project_id
+                    );
                     let result = client
                         .get(&url)
                         .header("Authorization", format!("Token {}", api_key))
@@ -426,146 +610,336 @@ impl VoiceKeyboardGui {
                             if response.status().is_success() {
                                 match response.json::<BillingResponse>().await {
                                     Ok(billing) => Message::BalanceReceived(Ok(billing)),
-                                    Err(e) => Message::BalanceReceived(Err(format!("Parse error: {}", e))),
+                                    Err(e) => {
+                                        Message::BalanceReceived(Err(format!("Parse error: {}", e)))
+                                    }
                                 }
                             } else {
-                                Message::BalanceReceived(Err(format!("API error: {}", response.status())))
+                                Message::BalanceReceived(Err(format!(
+                                    "API error: {}",
+                                    response.status()
+                                )))
                             }
                         }
                         Err(e) => Message::BalanceReceived(Err(format!("Request failed: {}", e))),
                     }
                 });
             }
-            Message::BalanceReceived(result) => {
-                match result {
-                    Ok(billing) => {
-                        if billing.balances.is_empty() {
-                            self.balance_info = "No balance information available".to_string();
-                        } else {
-                            let balance_text = billing.balances.iter()
-                                .map(|b| format!("{}: ${:.2}", b.units, b.amount))
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            self.balance_info = format!("Account Balance:\n{}", balance_text);
-                        }
-                    }
-                    Err(e) => {
-                        self.balance_info = format!("Error: {}", e);
+            Message::BalanceReceived(result) => match result {
+                Ok(billing) => {
+                    if billing.balances.is_empty() {
+                        self.balance_info = "No balance data".to_string();
+                    } else {
+                        self.balance_info = billing
+                            .balances
+                            .iter()
+                            .map(|b| format!("${:.2} ({})", b.amount, b.units))
+                            .collect::<Vec<_>>()
+                            .join("  |  ");
                     }
                 }
-            }
-            Message::TrayEvent => {
-                // Handle tray events
-            }
-            Message::ShowWindow => {
-                return window::get_latest().and_then(|id| window::gain_focus(id));
-            }
-            Message::HideWindow => {
-                return window::get_latest().and_then(|id| window::minimize(id, true));
-            }
+                Err(e) => {
+                    self.balance_info = format!("Error: {}", e);
+                }
+            },
         }
         Task::none()
     }
 
+    // ── Views ───────────────────────────────────────────────────────────
+
     fn view(&self) -> Element<Message> {
-        let title = text("Voice Keyboard Control").size(32);
-
-        let api_key_label = text("Deepgram API Key:");
-        let api_key_field = text_input("Enter your Deepgram API key", &self.api_key_input)
-            .on_input(Message::ApiKeyChanged)
-            .padding(10)
-            .size(20);
-
-        let project_id_label = text("Deepgram Project ID:");
-        let project_id_field = text_input("Enter your project ID", &self.project_id_input)
-            .on_input(Message::ProjectIdChanged)
-            .padding(10)
-            .size(20);
-
-        let hotkey_label = text("Hotkey (e.g., F13):");
-        let hotkey_field = text_input("Enter hotkey", &self.hotkey_input)
-            .on_input(Message::HotkeyChanged)
-            .padding(10)
-            .size(20);
-
-        let save_button = button("Save Configuration")
-            .on_press(Message::SaveConfig)
-            .padding(10);
-
-        let toggle_button = if self.is_recording {
-            button("Stop Dictation")
-                .on_press(Message::ToggleDictation)
-                .padding(15)
-                .style(|theme: &Theme, _status| {
-                    let palette = theme.extended_palette();
-                    button::Style {
-                        background: Some(iced::Background::Color(palette.danger.strong.color)),
-                        text_color: palette.danger.strong.text,
-                        ..button::Style::default()
-                    }
-                })
-        } else {
-            button("Start Dictation")
-                .on_press(Message::ToggleDictation)
-                .padding(15)
-                .style(|theme: &Theme, _status| {
-                    let palette = theme.extended_palette();
-                    button::Style {
-                        background: Some(iced::Background::Color(palette.success.strong.color)),
-                        text_color: palette.success.strong.text,
-                        ..button::Style::default()
-                    }
-                })
-        };
-
-        let status = text(&self.status_message).size(18);
-
-        // Billing panel
-        let billing_title = text("Billing Information").size(24);
-        let check_balance_button = button("Check Balance")
-            .on_press(Message::CheckBalance)
-            .padding(10);
-        let balance_display = text(&self.balance_info).size(16);
-
-        let content: Element<_> = column![
-            title,
-            text("").size(10),
-            api_key_label,
-            api_key_field,
-            text("").size(10),
-            project_id_label,
-            project_id_field,
-            text("").size(10),
-            hotkey_label,
-            hotkey_field,
-            text("").size(10),
-            save_button,
-            text("").size(20),
-            toggle_button,
-            text("").size(20),
-            status,
-            text("").size(30),
-            billing_title,
-            text("").size(10),
-            check_balance_button,
-            text("").size(10),
-            balance_display,
+        let content = column![
+            self.view_header(),
+            self.view_nav(),
+            match self.view {
+                AppView::Main => self.view_main(),
+                AppView::Settings => self.view_settings(),
+            }
         ]
-        .padding(20)
-        .spacing(5)
-        .into();
+        .spacing(0);
 
         container(content)
             .width(Length::Fill)
             .height(Length::Fill)
-            .center(Length::Fill)
+            .style(|_theme: &Theme| container::Style {
+                background: Some(iced::Background::Color(Color {
+                    r: 0.098,
+                    g: 0.106,
+                    b: 0.125,
+                    a: 1.0,
+                })),
+                ..container::Style::default()
+            })
             .into()
+    }
+
+    fn view_header(&self) -> Element<Message> {
+        let status_color = if self.is_recording {
+            RECORDING_RED
+        } else {
+            TEXT_DIM
+        };
+
+        let status_dot = text(if self.is_recording { "●" } else { "○" })
+            .size(14)
+            .color(status_color);
+
+        let title = text("Voice Keyboard")
+            .size(22)
+            .font(Font::DEFAULT)
+            .color(Color::WHITE);
+
+        let status = text(&self.status_message)
+            .size(13)
+            .color(status_color);
+
+        container(
+            row![
+                status_dot,
+                title,
+                Space::with_width(Length::Fill),
+                status,
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center),
+        )
+        .padding(iced::Padding::from([14, 20]))
+        .width(Length::Fill)
+        .style(|_theme: &Theme| container::Style {
+            background: Some(iced::Background::Color(SURFACE)),
+            ..container::Style::default()
+        })
+        .into()
+    }
+
+    fn view_nav(&self) -> Element<Message> {
+        let main_btn = button(text("Dictation").size(13))
+            .on_press(Message::SwitchView(AppView::Main))
+            .padding(iced::Padding::from([6, 16]))
+            .style(nav_button_style(self.view == AppView::Main));
+
+        let settings_btn = button(text("Settings").size(13))
+            .on_press(Message::SwitchView(AppView::Settings))
+            .padding(iced::Padding::from([6, 16]))
+            .style(nav_button_style(self.view == AppView::Settings));
+
+        container(row![main_btn, settings_btn].spacing(6))
+            .padding(iced::Padding::from([8, 20]))
+            .width(Length::Fill)
+            .into()
+    }
+
+    fn view_main(&self) -> Element<Message> {
+        // Record button
+        let btn_label = if self.is_recording {
+            "Stop Dictation"
+        } else {
+            "Start Dictation"
+        };
+
+        let record_btn = button(
+            text(btn_label)
+                .size(16)
+                .center()
+                .width(Length::Fill),
+        )
+        .on_press(Message::ToggleDictation)
+        .padding(iced::Padding::from([12, 0]))
+        .width(Length::Fill)
+        .style(record_button_style(self.is_recording));
+
+        // Transcript area
+        let mut transcript_content: Vec<Element<Message>> = Vec::new();
+
+        for line in &self.transcript_lines {
+            transcript_content.push(
+                text(line)
+                    .size(14)
+                    .color(TEXT_DIM)
+                    .into(),
+            );
+        }
+
+        // Current (live) transcript
+        if !self.current_transcript.is_empty() {
+            transcript_content.push(
+                text(&self.current_transcript)
+                    .size(14)
+                    .color(Color::WHITE)
+                    .into(),
+            );
+        }
+
+        if transcript_content.is_empty() {
+            transcript_content.push(
+                text(if self.is_recording {
+                    "Listening for speech..."
+                } else {
+                    "Transcripts will appear here"
+                })
+                .size(13)
+                .color(Color {
+                    r: 0.4,
+                    g: 0.42,
+                    b: 0.46,
+                    a: 1.0,
+                })
+                .into(),
+            );
+        }
+
+        let transcript_col = column(transcript_content).spacing(4);
+
+        let transcript_area = container(
+            scrollable(
+                container(transcript_col)
+                    .padding(12)
+                    .width(Length::Fill),
+            )
+            .height(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(transcript_area_style);
+
+        let transcript_label = text("Transcript")
+            .size(12)
+            .color(TEXT_DIM);
+
+        // Hotkey hint
+        let hotkey_hint = text(format!("Hotkey: {}", self.config.hotkey_code))
+            .size(12)
+            .color(TEXT_DIM);
+
+        container(
+            column![
+                container(
+                    column![record_btn, hotkey_hint]
+                        .spacing(8)
+                        .align_x(iced::Alignment::Center),
+                )
+                .width(Length::Fill)
+                .style(card_style)
+                .padding(16),
+                transcript_label,
+                transcript_area,
+            ]
+            .spacing(8),
+        )
+        .padding(iced::Padding::from([8, 20]))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
+    fn view_settings(&self) -> Element<Message> {
+        let api_section = container(
+            column![
+                text("Deepgram API").size(14).color(ACCENT),
+                text("API Key").size(12).color(TEXT_DIM),
+                text_input("dg_...", &self.api_key_input)
+                    .on_input(Message::ApiKeyChanged)
+                    .padding(10)
+                    .size(14),
+                text("Project ID (for billing)").size(12).color(TEXT_DIM),
+                text_input("Project ID", &self.project_id_input)
+                    .on_input(Message::ProjectIdChanged)
+                    .padding(10)
+                    .size(14),
+            ]
+            .spacing(6),
+        )
+        .style(card_style)
+        .padding(16)
+        .width(Length::Fill);
+
+        let hotkey_section = container(
+            column![
+                text("Hotkey").size(14).color(ACCENT),
+                text("Toggle key").size(12).color(TEXT_DIM),
+                text_input("F13", &self.hotkey_input)
+                    .on_input(Message::HotkeyChanged)
+                    .padding(10)
+                    .size(14),
+            ]
+            .spacing(6),
+        )
+        .style(card_style)
+        .padding(16)
+        .width(Length::Fill);
+
+        let save_btn = button(
+            text("Save Settings")
+                .size(14)
+                .center()
+                .width(Length::Fill),
+        )
+        .on_press(Message::SaveConfig)
+        .padding(iced::Padding::from([10, 0]))
+        .width(Length::Fill)
+        .style(secondary_button_style);
+
+        // Billing
+        let balance_display: String = if self.balance_info.is_empty() {
+            "Click to check account balance".into()
+        } else {
+            self.balance_info.clone()
+        };
+
+        let billing_section = container(
+            column![
+                text("Billing").size(14).color(ACCENT),
+                row![
+                    button(text("Check Balance").size(13))
+                        .on_press(Message::CheckBalance)
+                        .padding(iced::Padding::from([6, 12]))
+                        .style(secondary_button_style),
+                    text(balance_display).size(13).color(TEXT_DIM),
+                ]
+                .spacing(10)
+                .align_y(iced::Alignment::Center),
+            ]
+            .spacing(6),
+        )
+        .style(card_style)
+        .padding(16)
+        .width(Length::Fill);
+
+        container(
+            scrollable(
+                column![
+                    api_section,
+                    hotkey_section,
+                    horizontal_rule(1),
+                    save_btn,
+                    horizontal_rule(1),
+                    billing_section,
+                ]
+                .spacing(12),
+            ),
+        )
+        .padding(iced::Padding::from([8, 20]))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 }
 
+// ── Entry point ─────────────────────────────────────────────────────────
+
 fn main() -> iced::Result {
     iced::application("Voice Keyboard", VoiceKeyboardGui::update, VoiceKeyboardGui::view)
-        .window_size((500.0, 600.0))
+        .theme(|_| Theme::Dark)
+        .window_size((480.0, 560.0))
         .centered()
-        .run_with(VoiceKeyboardGui::new)
+        .run_with(|| {
+            let (gui, task) = VoiceKeyboardGui::new();
+            // Kick off the tick loop
+            let tick_task = Task::future(async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Message::Tick
+            });
+            (gui, Task::batch([task, tick_task]))
+        })
 }

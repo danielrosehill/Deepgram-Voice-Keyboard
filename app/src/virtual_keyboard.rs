@@ -7,7 +7,12 @@ use nix::unistd::close;
 use regex::Regex;
 use std::io::Write;
 use std::os::unix::io::FromRawFd;
+use std::sync::LazyLock;
 use tracing::{debug, error, info, warn};
+
+/// Pre-compiled regex for detecting the word "enter" at the end of a transcript.
+static ENTER_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\s*\benter\b[[:punct:]\s]*$").unwrap());
 
 use crate::input_event::*;
 
@@ -322,17 +327,8 @@ impl<H: KeyboardHardware> VirtualKeyboard<H> {
         debug!("Finalizing transcript: '{}'", self.current_text);
         
         if self.interpret_enter_word {
-            // Regex to match "enter" (case-insensitive) at the end, optionally followed by 
-            // punctuation and/or whitespace: (?i)\s*\benter\b[[:punct:]\s]*$
-            // (?i) = case insensitive
-            // \s* = optional leading whitespace  
-            // \benter\b = the word "enter" with word boundaries
-            // [[:punct:]\s]* = optional trailing punctuation or whitespace
-            // $ = end of string
-            let enter_regex = Regex::new(r"(?i)\s*\benter\b[[:punct:]\s]*$").unwrap();
-            
             // Find the match and extract the information we need before mutating self
-            let match_info = enter_regex.find(&self.current_text).map(|m| {
+            let match_info = ENTER_REGEX.find(&self.current_text).map(|m| {
                 (m.start(), m.as_str().chars().count(), m.as_str().to_string())
             });
             

@@ -60,8 +60,8 @@ enum ServerMessage {
     Configuration {
         #[serde(default)]
         eot_threshold: Option<f64>,
-        #[serde(default)]
-        preflight_threshold: Option<f64>,
+        #[serde(default, alias = "preflight_threshold")]
+        eager_eot_threshold: Option<f64>,
     },
 }
 
@@ -156,15 +156,21 @@ impl SttClient {
             debug!("DEEPGRAM_API_KEY not set; connecting without Authorization header");
         }
 
-        // Establish WebSocket connection with the request
-        let (ws_stream, _resp) = connect_async(request).await.map_err(enrich_ws_error)?;
+        // Establish WebSocket connection with timeout
+        let (ws_stream, _resp) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connect_async(request),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("WebSocket connection timed out after 10s"))?
+        .map_err(enrich_ws_error)?;
 
         debug!("Connected to speech-to-text service");
 
         let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
-        // Create channel for sending audio data
-        let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(32);
+        // Create channel for sending audio data (128 slots ≈ ~13s of audio at 160ms chunks)
+        let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(128);
 
         // Spawn task to handle WebSocket communication
         let handle = tokio::spawn(async move {
@@ -221,9 +227,9 @@ impl SttClient {
                                 }
                                 ServerMessage::Configuration {
                                     eot_threshold,
-                                    preflight_threshold,
+                                    eager_eot_threshold,
                                 } => {
-                                    info!("Configuration ack: eot_threshold={:?}, preflight_threshold={:?}", eot_threshold, preflight_threshold);
+                                    info!("Configuration ack: eot_threshold={:?}, eager_eot_threshold={:?}", eot_threshold, eager_eot_threshold);
                                 }
                                 ServerMessage::Error {
                                     sequence_id,

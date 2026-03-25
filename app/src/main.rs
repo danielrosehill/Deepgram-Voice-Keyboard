@@ -69,25 +69,28 @@ impl OriginalUser {
             setuid(self.uid).context("Failed to drop user privileges")?;
 
             // Restore environment variables for the original user
-            if let Some(ref home) = self.home {
-                env::set_var("HOME", home);
-            }
-            if let Some(ref user) = self.user {
-                env::set_var("USER", user);
-            }
+            // Safety: called during single-threaded startup before spawning async tasks
+            unsafe {
+                if let Some(ref home) = self.home {
+                    env::set_var("HOME", home);
+                }
+                if let Some(ref user) = self.user {
+                    env::set_var("USER", user);
+                }
 
-            // Restore audio-related environment variables
-            if let Some(pulse_path) = pulse_runtime_path {
-                env::set_var("PULSE_RUNTIME_PATH", pulse_path);
-            }
-            if let Some(xdg_path) = xdg_runtime_dir {
-                env::set_var("XDG_RUNTIME_DIR", xdg_path);
-            }
-            if let Some(disp) = display {
-                env::set_var("DISPLAY", disp);
-            }
-            if let Some(wayland_disp) = wayland_display {
-                env::set_var("WAYLAND_DISPLAY", wayland_disp);
+                // Restore audio-related environment variables
+                if let Some(pulse_path) = pulse_runtime_path {
+                    env::set_var("PULSE_RUNTIME_PATH", pulse_path);
+                }
+                if let Some(xdg_path) = xdg_runtime_dir {
+                    env::set_var("XDG_RUNTIME_DIR", xdg_path);
+                }
+                if let Some(disp) = display {
+                    env::set_var("DISPLAY", disp);
+                }
+                if let Some(wayland_disp) = wayland_display {
+                    env::set_var("WAYLAND_DISPLAY", wayland_disp);
+                }
             }
 
             debug!("Successfully dropped privileges to user");
@@ -150,6 +153,12 @@ async fn main() -> Result<()> {
                 .help("Convert all typed text to uppercase")
                 .action(clap::ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("json-output")
+                .long("json-output")
+                .help("Print transcript events as JSON lines to stdout (for GUI)")
+                .action(clap::ArgAction::SetTrue),
+        )
         .get_matches();
 
     let device_name = "Voice Keyboard";
@@ -177,7 +186,7 @@ async fn main() -> Result<()> {
             .get_one::<String>("stt-url")
             .map(|s| s.as_str())
             .unwrap_or(stt_client::STT_URL);
-        test_stt(keyboard, stt_url).await?;
+        test_stt(keyboard, stt_url, false).await?;
     } else {
         let debug_mode = matches.get_flag("debug-stt");
         let stt_url = matches
@@ -185,10 +194,12 @@ async fn main() -> Result<()> {
             .map(|s| s.as_str())
             .unwrap_or(stt_client::STT_URL);
 
+        let json_output = matches.get_flag("json-output");
+
         if debug_mode {
             debug_stt(stt_url).await?;
         } else {
-            test_stt(keyboard, stt_url).await?;
+            test_stt(keyboard, stt_url, json_output).await?;
         }
     }
 
@@ -237,7 +248,7 @@ async fn test_audio() -> Result<()> {
     Ok(())
 }
 
-async fn test_stt(keyboard: VirtualKeyboard<RealKeyboardHardware>, stt_url: &str) -> Result<()> {
+async fn test_stt(keyboard: VirtualKeyboard<RealKeyboardHardware>, stt_url: &str, json_output: bool) -> Result<()> {
     info!("Testing speech-to-text functionality...");
 
     // Wrap keyboard in a mutex to allow mutable access from the closure
@@ -248,6 +259,13 @@ async fn test_stt(keyboard: VirtualKeyboard<RealKeyboardHardware>, stt_url: &str
     let last_update_log_cloned = last_update_log.clone();
 
     run_stt(stt_url, move |result| {
+        // Emit JSON line to stdout for GUI consumption
+        if json_output {
+            if let Ok(json) = serde_json::to_string(&result) {
+                println!("{}", json);
+            }
+        }
+
         if !result.transcript.is_empty() {
             if result.event == "Update" {
                 let now = Instant::now();
@@ -261,7 +279,7 @@ async fn test_stt(keyboard: VirtualKeyboard<RealKeyboardHardware>, stt_url: &str
                     *last = Some(now);
                 }
             } else {
-                // Always log non-Update events (StartOfTurn, Preflight, SpeechResumed, EndOfTurn)
+                // Always log non-Update events (StartOfTurn, EagerEndOfTurn, TurnResumed, EndOfTurn)
                 info!("Transcription [{}]: {}", result.event, result.transcript);
             }
         }
@@ -344,12 +362,18 @@ where
             data.to_vec()
         };
 
-        // Create audio chunks and send them
+        // Create audio chunks and send them (non-blocking to avoid stalling the audio thread)
         let chunks = audio_buffer.add_samples(&mono_data);
         for chunk in chunks {
             debug!("Sending audio chunk: {} bytes", chunk.len());
-            if let Err(e) = audio_tx_clone.blocking_send(chunk) {
-                error!("Failed to send audio chunk: {}", e);
+            match audio_tx_clone.try_send(chunk) {
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    debug!("Audio channel full, dropping chunk");
+                }
+                Err(e) => {
+                    error!("Failed to send audio chunk: {}", e);
+                }
             }
         }
     })?;
