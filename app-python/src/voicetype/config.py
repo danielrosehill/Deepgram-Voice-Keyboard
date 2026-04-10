@@ -22,12 +22,24 @@ def _config_path() -> Path:
     return _config_dir() / "config.json"
 
 
+# Legacy field names that may exist in older config files
+_FIELD_ALIASES = {
+    "hotkey_code": "hotkey",
+}
+
+
 @dataclass
 class Config:
     api_key: str = ""
     hotkey: str = "F13"
+    hotkey_start: str = ""
+    hotkey_stop: str = ""
+    hotkey_pause: str = ""
     project_id: str = ""
     vad_enabled: bool = True
+    push_to_talk: bool = False
+    push_to_talk_key: str = "F13"
+    sound_enabled: bool = True
 
     def save(self) -> None:
         path = _config_path()
@@ -42,6 +54,12 @@ class Config:
             return cls()
         try:
             data = json.loads(path.read_text())
+            # Apply legacy field aliases
+            for old_name, new_name in _FIELD_ALIASES.items():
+                if old_name in data and new_name not in data:
+                    data[new_name] = data.pop(old_name)
+                elif old_name in data:
+                    del data[old_name]
             return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
         except Exception as e:
             log.warning("Failed to load config: %s", e)

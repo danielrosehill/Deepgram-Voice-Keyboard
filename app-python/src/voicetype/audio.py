@@ -56,6 +56,7 @@ class AudioCapture:
         self._stream: Optional[sd.InputStream] = None
         self._vad: Optional[TenVad] = None
         self._running = False
+        self._paused = False
         self._silence_since: float = 0.0
         self._last_keepalive: float = 0.0
 
@@ -96,6 +97,11 @@ class AudioCapture:
             SAMPLE_RATE, CHANNELS, BLOCK_SIZE, "on" if self.vad_active else "off",
         )
 
+    def set_paused(self, paused: bool) -> None:
+        """Pause or resume audio capture. While paused, silence is sent as keepalive."""
+        self._paused = paused
+        log.info("Audio capture %s", "paused" if paused else "resumed")
+
     def stop(self) -> None:
         """Stop capturing and signal end-of-stream."""
         self._running = False
@@ -116,6 +122,16 @@ class AudioCapture:
 
         if status:
             log.warning("Audio callback status: %s", status)
+
+        # When paused, drop audio but send keepalives to prevent WS timeout
+        if self._paused:
+            if self._check_keepalive():
+                silence = bytes(BLOCK_SIZE * 2)  # PCM16 silence
+                try:
+                    self._loop.call_soon_threadsafe(self._queue.put_nowait, silence)
+                except asyncio.QueueFull:
+                    pass
+            return
 
         # indata is (frames, channels) float32
         samples = indata[:, 0]  # mono
