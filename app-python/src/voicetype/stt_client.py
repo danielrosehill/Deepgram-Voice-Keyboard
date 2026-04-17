@@ -40,10 +40,17 @@ class TranscriptionResult:
 class SttClient:
     """Streams audio to Deepgram and delivers transcription callbacks."""
 
-    def __init__(self, url: str = STT_URL, sample_rate: int = 16000, api_key: str = ""):
+    def __init__(
+        self,
+        url: str = STT_URL,
+        sample_rate: int = 16000,
+        api_key: str = "",
+        model: str = "flux-general-en",
+    ):
         self.url = url
         self.sample_rate = sample_rate
         self.api_key = api_key
+        self.model = model
 
     async def run(
         self,
@@ -54,7 +61,7 @@ class SttClient:
 
         Send None to audio_queue to signal end-of-stream.
         """
-        ws_url = f"{self.url}?model=flux-general-en&sample_rate={self.sample_rate}&encoding=linear16"
+        ws_url = f"{self.url}?model={self.model}&sample_rate={self.sample_rate}&encoding=linear16"
 
         headers = {}
         if self.api_key:

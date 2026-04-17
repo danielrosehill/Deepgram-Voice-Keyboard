@@ -71,8 +71,8 @@ def _build_char_map() -> dict[str, tuple[int, bool]]:
 _CHAR_MAP = _build_char_map()
 
 # Delay between keystrokes (seconds)
-_KEY_DELAY = 0.008
-_BACKSPACE_DELAY = 0.004
+_KEY_DELAY = 0.002
+_BACKSPACE_DELAY = 0.001
 
 
 @dataclass

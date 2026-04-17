@@ -14,6 +14,7 @@ from PyQt6.QtCore import QTimer, Qt, pyqtSignal, QObject
 from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor
 from PyQt6.QtWidgets import (
     QApplication,
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -32,10 +33,17 @@ from PyQt6.QtWidgets import (
 
 from .audio import AudioCapture
 from .config import Config
+from .cost_dialog import CostDialog
 from .hotkeys import HotkeyListener
 from .sounds import play_start, play_stop, play_pause, play_resume
 from .stt_client import SttClient, TranscriptionResult
 from .virtual_keyboard import VirtualKeyboard
+
+# Deepgram streaming models compatible with the current v2/listen pipeline
+AVAILABLE_MODELS: list[tuple[str, str]] = [
+    ("flux-general-en", "Flux (English) — conversational, low latency"),
+    ("flux-general-multi", "Flux (Multilingual)"),
+]
 
 log = logging.getLogger(__name__)
 
@@ -217,6 +225,25 @@ class VoiceTypeWindow(QMainWindow):
         self._project_id_input.setPlaceholderText("Project ID")
         layout.addWidget(self._project_id_input)
 
+        # API Key ID (accessor) — optional, scopes cost queries to this key
+        layout.addWidget(QLabel("API Key ID (optional, scopes costs to this key)"))
+        self._api_key_id_input = QLineEdit(self._config.api_key_id)
+        self._api_key_id_input.setPlaceholderText("Accessor ID — leave blank for project-wide costs")
+        layout.addWidget(self._api_key_id_input)
+
+        # Model selector
+        layout.addWidget(QLabel("Model"))
+        self._model_combo = QComboBox()
+        for value, label in AVAILABLE_MODELS:
+            self._model_combo.addItem(label, value)
+        # Select current
+        idx = next(
+            (i for i, (v, _) in enumerate(AVAILABLE_MODELS) if v == self._config.model),
+            0,
+        )
+        self._model_combo.setCurrentIndex(idx)
+        layout.addWidget(self._model_combo)
+
         layout.addSpacing(8)
 
         # VAD toggle
@@ -290,9 +317,15 @@ class VoiceTypeWindow(QMainWindow):
             f"background: {ACCENT}; color: white; border-radius: 6px; padding: 6px 12px;"
         )
         check_btn.clicked.connect(self._check_balance)
+        costs_btn = QPushButton("View Costs")
+        costs_btn.setStyleSheet(
+            f"background: {ACCENT}; color: white; border-radius: 6px; padding: 6px 12px;"
+        )
+        costs_btn.clicked.connect(self._open_cost_dialog)
         self._balance_label = QLabel("Click to check account balance")
         self._balance_label.setStyleSheet(f"color: {TEXT_DIM}; font-size: 13px;")
         billing_row.addWidget(check_btn)
+        billing_row.addWidget(costs_btn)
         billing_row.addWidget(self._balance_label)
         billing_row.addStretch()
         layout.addLayout(billing_row)
@@ -466,6 +499,7 @@ class VoiceTypeWindow(QMainWindow):
         stt = SttClient(
             sample_rate=16000,
             api_key=self._config.api_key,
+            model=self._config.model or "flux-general-en",
         )
 
         def _run_stt() -> None:
@@ -649,6 +683,8 @@ class VoiceTypeWindow(QMainWindow):
     def _save_config(self) -> None:
         self._config.api_key = self._api_key_input.text().strip()
         self._config.project_id = self._project_id_input.text().strip()
+        self._config.api_key_id = self._api_key_id_input.text().strip()
+        self._config.model = self._model_combo.currentData() or "flux-general-en"
         self._config.vad_enabled = self._vad_check.isChecked()
         self._config.sound_enabled = self._sound_check.isChecked()
         self._config.hotkey = self._hotkey_input.text().strip()
@@ -698,6 +734,15 @@ class VoiceTypeWindow(QMainWindow):
             QTimer.singleShot(0, lambda: self._balance_label.setText(text))
 
         threading.Thread(target=_fetch, daemon=True).start()
+
+    def _open_cost_dialog(self) -> None:
+        dlg = CostDialog(
+            project_id=self._config.project_id,
+            api_key=self._config.api_key,
+            accessor=self._config.api_key_id,
+            parent=self,
+        )
+        dlg.exec()
 
     # ── Cleanup ──────────────────────────────────────────────────────
 
